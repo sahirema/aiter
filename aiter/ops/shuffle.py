@@ -1,37 +1,55 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 
-# Tensor attribute names used by ``pad_weight_for_bpreshuffle`` and propagated
-# by ``shuffle_weight`` so downstream callers (e.g. SGLang's compressed-tensors
-# FP8 path) can detect padded weights without inspecting raw shapes.
-_BPRESHUFFLE_PADDING_ATTRS = ("aiter_original_k", "aiter_padded_k", "aiter_k_padding")
+# Tensor attribute names stamped by ``pad_weight_for_bpreshuffle`` and
+# propagated by ``shuffle_weight``. These survive only as long as the
+# Python tensor wrapper that carries them; ``torch.nn.Parameter(t)`` creates
+# a brand-new wrapper that does not inherit ``t.__dict__`` so SGLang's
+# compressed-tensors path -- which wraps every shuffled weight in
+# ``nn.Parameter(..., requires_grad=False)`` -- silently strips these. The
+# storage-keyed sidecar registry below is the channel that actually survives
+# the wrap; the attributes are kept for ergonomics and tests that don't
+# round-trip through ``Parameter``.
+_BPRESHUFFLE_PADDING_ATTRS = (
+    "aiter_original_k",
+    "aiter_padded_k",
+    "aiter_k_padding",
+    "aiter_original_n",
+    "aiter_padded_n",
+    "aiter_n_padding",
+)
 
-# Default K alignment used when padding weights for the bpreshuffle GEMM. 256
-# covers all currently-shipping CK bpreshuffle BLOCK_K values for FP8 on
-# gfx950 regardless of whether the K-padding CK patch is active. With the
-# K-padding CK patch (composable_kernel branch ``glm4v-fp8-padding-ck``) the
-# floor drops to 64 (the MFMA K-per-slot atomic granularity); set
-# ``AITER_BPRESHUFFLE_PAD_ALIGNMENT=64`` to reduce the padded tail of GLM-4.6V
-# weights from up to 168 K-rows down to <=40. If a padded shape is then
-# rejected by ``IsSupportedArgument``, bump back to 256.
+# Default K/N alignment used when padding weights for the bpreshuffle GEMM.
+# 256 covers all currently-shipping CK bpreshuffle BLOCK_K / NPerBlock values
+# for FP8 on gfx950 regardless of whether the K-padding CK patch is active.
+# With the K-padding CK patch (composable_kernel branch
+# ``glm4v-fp8-padding-ck``) the K floor drops to 64 (the MFMA K-per-slot
+# atomic granularity); set ``AITER_BPRESHUFFLE_PAD_ALIGNMENT=64`` to reduce
+# the padded K tail from up to 168 K-rows down to <=40. The N axis still
+# requires 256-alignment because the CK ``IsSupportedArgument`` check on the
+# pre-shuffled layout has no analogous N-pad runtime path. If a padded shape
+# is still rejected, bump to 512.
 _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT = int(
     os.environ.get("AITER_BPRESHUFFLE_PAD_ALIGNMENT", "256")
 )
 
 # Auto-padding controls whether ``shuffle_weight`` transparently pads K-dim
-# to ``_DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT`` when the input K is unaligned.
-# Default is on so SGLang's stock ``shuffle_weight(weight, (16, 16))`` call
-# in compressed_tensors_w8a8_fp8.py works for GLM-4.6V at TP={2,4,8} without
-# patching SGLang. Disable with ``AITER_BPRESHUFFLE_AUTO_PAD=0`` to restore
-# the strict K%BK==0 assertion behavior. Read inline so tests can flip the
-# env via ``monkeypatch.setenv`` without reloading the module.
+# and N-dim to ``_DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT`` when the input is
+# unaligned. Default is on so SGLang's stock
+# ``shuffle_weight(weight, (16, 16))`` call in
+# compressed_tensors_w8a8_fp8.py works for GLM-4.6V at TP={2,4,8} (K
+# unaligned on down_proj, N unaligned on gate_up_proj) without patching
+# SGLang. Disable with ``AITER_BPRESHUFFLE_AUTO_PAD=0`` to restore the
+# strict K%BK==0 / IsSupportedArgument assertion behaviour. Read inline so
+# tests can flip the env via ``monkeypatch.setenv`` without reloading the
+# module.
 def _bpreshuffle_auto_pad_enabled() -> bool:
     return os.environ.get("AITER_BPRESHUFFLE_AUTO_PAD", "1") not in (
         "0",
@@ -45,32 +63,121 @@ def _bpreshuffle_auto_pad_enabled() -> bool:
 _auto_pad_warned = False
 
 
+# --- storage-keyed padding-metadata sidecar ------------------------------- #
+#
+# ``torch.nn.Parameter(t, requires_grad=False)`` (SGLang's
+# compressed-tensors FP8 path wraps every shuffled weight this way) creates
+# a fresh Python ``Tensor`` wrapper around the same underlying ``Storage``.
+# Python-side attributes attached to ``t`` (``aiter_original_k`` etc.) do
+# not propagate to the Parameter wrapper. The underlying ``Storage``
+# (and therefore ``data_ptr()``) is preserved, so we side-channel the
+# padding metadata through a process-global dict keyed on the storage's
+# ``data_ptr()`` (an integer).
+#
+# Lifecycle: entries are inserted by ``pad_weight_for_bpreshuffle`` and by
+# the auto-pad branch of ``shuffle_weight``, and never explicitly removed.
+# For inference servers each shuffled weight lives for the process lifetime
+# (the Parameter holds the storage), so the dict stays bounded by the
+# number of FP8 linears in the loaded model -- a few hundred entries at
+# most, each a ~24-byte tuple plus an int key. On stale lookups (a freed
+# storage's address being reused by a new allocation) ``shape`` validation
+# inside ``_lookup_bpreshuffle_padding`` rejects the entry.
+_BPRESHUFFLE_PAD_REGISTRY: "dict[int, Tuple[int, int, int, int]]" = {}
+
+
+def _storage_key(t: torch.Tensor) -> Optional[int]:
+    """Return ``t``'s underlying storage data_ptr, or ``None`` if the tensor
+    has no addressable storage (e.g. ``meta`` tensors used by torch.compile
+    fake-tensor tracing)."""
+    try:
+        storage = t.untyped_storage()
+    except (RuntimeError, AttributeError, NotImplementedError):
+        return None
+    try:
+        ptr = storage.data_ptr()
+    except (RuntimeError, AttributeError, NotImplementedError):
+        return None
+    return ptr if ptr != 0 else None
+
+
+def _register_bpreshuffle_padding(
+    t: torch.Tensor,
+    original_k: int,
+    padded_k: int,
+    original_n: int,
+    padded_n: int,
+) -> None:
+    """Record ``(orig_k, padded_k, orig_n, padded_n)`` for ``t``'s storage.
+
+    No-op when no padding actually happened on either axis -- we never
+    register identity entries because that would force a registry lookup
+    on every aligned weight at GEMM time, and the lookup itself triggers
+    a shape validation that's pointless for aligned shapes.
+    """
+    if padded_k == original_k and padded_n == original_n:
+        return
+    key = _storage_key(t)
+    if key is None:
+        return
+    _BPRESHUFFLE_PAD_REGISTRY[key] = (original_k, padded_k, original_n, padded_n)
+
+
+def _lookup_bpreshuffle_padding(
+    t: torch.Tensor,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Look up padding metadata for ``t``. Returns
+    ``(orig_k, padded_k, orig_n, padded_n)`` or ``None``.
+
+    The registry value is validated against ``t``'s current shape; a
+    stale entry (e.g. after storage GC + reallocation reused the address)
+    where the recorded ``padded_*`` no longer matches ``t.shape`` is
+    treated as a miss. This is the safety net that lets us key on
+    ``data_ptr()`` without a per-tensor weakref.
+    """
+    key = _storage_key(t)
+    if key is None:
+        return None
+    entry = _BPRESHUFFLE_PAD_REGISTRY.get(key)
+    if entry is None:
+        return None
+    _, padded_k, _, padded_n = entry
+    if t.shape[-1] != padded_k or t.shape[-2] != padded_n:
+        return None
+    return entry
+
+
 def pad_weight_for_bpreshuffle(
     x: torch.Tensor,
     alignment: int = _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT,
     layout=(16, 16),
+    pad_n: bool = False,
 ) -> torch.Tensor:
-    """Right-pad ``K`` (last dim) to a multiple of ``alignment`` with zeros.
+    """Right-pad ``K`` (last dim) -- and optionally ``N`` (second-to-last) --
+    to a multiple of ``alignment`` with zeros.
 
     Returns a contiguous tensor tagged with ``aiter_original_k``,
-    ``aiter_padded_k`` and ``aiter_k_padding`` metadata so downstream wrappers
-    can detect padding without inspecting shapes. The caller is responsible
-    for matching activation padding at runtime.
+    ``aiter_padded_k`` and ``aiter_k_padding`` (and, when ``pad_n=True``,
+    the matching ``aiter_*_n`` attrs) and *also* registered in the
+    storage-keyed sidecar (so the metadata survives a subsequent
+    ``torch.nn.Parameter`` wrap).
 
-    The padded tail is exactly zero, which keeps the FP8 GEMM result
-    mathematically identical for per-token / per-channel quantization
-    (``x_scale`` is per token and ``w_scale`` is per output channel, neither
-    is affected by padding the K dimension).
+    The padded tail is exactly zero. For per-token / per-channel FP8 quant
+    this keeps the GEMM result mathematically identical: ``x_scale`` is per
+    token (no K dim) and ``w_scale`` is per output channel (so K-padding
+    leaves it untouched; N-padding requires the matching ``w_scale``
+    N-extension which ``gemm_a8w8_bpreshuffle`` handles automatically using
+    the sidecar metadata).
 
-    ``alignment=256`` covers all currently-shipping CK bpreshuffle ``BLOCK_K``
-    values for FP8 on gfx950. If a padded shape is still rejected by
-    ``IsSupportedArgument``, bump via ``AITER_BPRESHUFFLE_PAD_ALIGNMENT=512``
-    and rerun the tuner.
+    ``alignment=256`` covers all currently-shipping CK bpreshuffle
+    ``BLOCK_K`` / ``NPerBlock`` values for FP8 on gfx950. If a padded shape
+    is still rejected by ``IsSupportedArgument``, bump via
+    ``AITER_BPRESHUFFLE_PAD_ALIGNMENT=512`` and rerun the tuner.
 
-    Memory peak during this helper is ``2 * sizeof(weight)`` because both ``x``
-    and ``out`` are live until return. Callers that load weights eagerly
-    should ``del`` the original tensor and call ``torch.cuda.empty_cache()``
-    once the returned tensor has been wrapped in a ``Parameter``.
+    Memory peak during this helper is ``2 * sizeof(weight)`` because both
+    ``x`` and ``out`` are live until return. Callers that load weights
+    eagerly should ``del`` the original tensor and call
+    ``torch.cuda.empty_cache()`` once the returned tensor has been wrapped
+    in a ``Parameter``.
     """
     if alignment <= 0:
         raise ValueError(
@@ -80,29 +187,77 @@ def pad_weight_for_bpreshuffle(
 
     original_k = x.shape[-1]
     padded_k = ((original_k + alignment - 1) // alignment) * alignment
-    if padded_k == original_k:
-        out = x.contiguous()
+    original_n = x.shape[-2] if x.ndim >= 2 else 1
+    if pad_n and x.ndim >= 2:
+        padded_n = ((original_n + alignment - 1) // alignment) * alignment
     else:
-        # ``torch.empty`` + targeted tail zero is cheaper than ``torch.zeros``
-        # because we avoid an unnecessary full zero pass over ``original_k``
-        # elements before overwriting them.
+        padded_n = original_n
+
+    if padded_k == original_k and padded_n == original_n:
+        out = x.contiguous()
+    elif padded_n == original_n:
+        # K-only pad: avoid a full zero pass over ``original_k`` elements
+        # by allocating with ``empty`` and zeroing only the K tail.
         out = torch.empty(
             *x.shape[:-1], padded_k, dtype=x.dtype, device=x.device
         )
         out[..., :original_k].copy_(x)
         out[..., original_k:].zero_()
+    else:
+        # N (and possibly K) pad: allocate the full padded box with zeros
+        # then copy the original block. A separate ``zero_()`` of the
+        # bottom/right L-shaped tail would need two strided writes; one
+        # ``zeros`` allocation is simpler and not measurably slower at
+        # the sizes we care about (<=64MB per weight).
+        out = torch.zeros(
+            *x.shape[:-2], padded_n, padded_k, dtype=x.dtype, device=x.device
+        )
+        out[..., :original_n, :original_k].copy_(x)
+
     out.aiter_original_k = original_k
     out.aiter_padded_k = padded_k
     out.aiter_k_padding = padded_k - original_k
+    out.aiter_original_n = original_n
+    out.aiter_padded_n = padded_n
+    out.aiter_n_padding = padded_n - original_n
+    _register_bpreshuffle_padding(out, original_k, padded_k, original_n, padded_n)
     return out
 
 
 def _propagate_bpreshuffle_padding_attrs(
     src: torch.Tensor, dst: torch.Tensor
 ) -> None:
+    """Copy padding attrs from ``src`` to ``dst`` and re-register the
+    sidecar at ``dst``'s storage.
+
+    Re-registration is necessary because operations such as ``.contiguous()``
+    after a non-trivial permutation -- the core of the shuffle path --
+    allocate a new storage, so ``dst`` has a different ``data_ptr()`` from
+    ``src`` even though it carries the same logical metadata.
+    """
     for attr in _BPRESHUFFLE_PADDING_ATTRS:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
+
+    # Re-register dst in the sidecar so the metadata is reachable after
+    # ``torch.nn.Parameter`` wrapping (Parameter shares storage with its
+    # input, so ``dst.untyped_storage().data_ptr()`` matches the wrapped
+    # Parameter's ``data_ptr()``).
+    src_entry = _lookup_bpreshuffle_padding(src)
+    if src_entry is None and hasattr(src, "aiter_original_k"):
+        # Fall back to attrs (the helper above stamps both attrs and the
+        # sidecar, but external callers might stamp only attrs).
+        src_entry = (
+            getattr(src, "aiter_original_k", src.shape[-1]),
+            getattr(src, "aiter_padded_k", src.shape[-1]),
+            getattr(src, "aiter_original_n", src.shape[-2]),
+            getattr(src, "aiter_padded_n", src.shape[-2]),
+        )
+    if src_entry is not None:
+        original_k, padded_k, original_n, padded_n = src_entry
+        _register_bpreshuffle_padding(
+            dst, original_k, padded_k, original_n, padded_n
+        )
 
 
 def shuffle_weight(
@@ -139,33 +294,72 @@ def shuffle_weight(
     BK = IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
     BN = IN
-    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
 
-    # Transparent K-padding for unaligned inputs (e.g. GLM-4.6V FP8 at TP=4/8
-    # has per-shard K=2736 / 1368 which trip the K%BK==0 assertion). We auto-
-    # pad here so SGLang's stock compressed-tensors path can call
-    # ``shuffle_weight(weight, (16, 16))`` directly without first invoking
-    # ``pad_weight_for_bpreshuffle``. Activation matching happens in
-    # ``gemm_a8w8_bpreshuffle``, which reads the ``aiter_padded_k`` metadata
-    # propagated by ``_propagate_bpreshuffle_padding_attrs`` below.
-    if _bpreshuffle_auto_pad_enabled() and (
-        x.shape[-1] % _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT != 0
-    ):
+    # Transparent K/N-padding for unaligned inputs. Two GLM-4.6V FP8 cases:
+    #
+    #   * K unaligned: down_proj at TP={2,4,8} has per-shard K =
+    #     intermediate_size / TP = {5472, 2736, 1368} which trip the
+    #     ``K % BK == 0`` assertion below (BK=32, none of those K values
+    #     are multiples of 32... wait, 5472 IS a multiple of 32 so the
+    #     pre-pad assertion passes for TP=2 -- but the downstream CK
+    #     ``IsSupportedArgument`` still rejects intra-K0-slot tails. We
+    #     pad K to 256 unconditionally so all three TP cases satisfy both
+    #     the AIter shuffle assertion AND the CK dispatch).
+    #   * N unaligned: gate_up_proj at TP={4,8} has per-shard
+    #     N = 2 * intermediate_size / TP = {5472, 2736}; both pass the
+    #     ``N % BN == 0`` shuffle assertion (BN=16) but no CK bpreshuffle
+    #     instance has an ``NPerBlock`` that divides them, so dispatch
+    #     fails with ``"This GEMM is not supported!"``. Padding N to a
+    #     multiple of 256 makes the CK instance list match.
+    #
+    # Activation matching (XQ right-pad on K) and output slicing (Y left-
+    # truncate on N) happen inside ``gemm_a8w8_bpreshuffle``, which reads
+    # the metadata through the storage-keyed sidecar registered by
+    # ``_propagate_bpreshuffle_padding_attrs`` below.
+    auto_pad = _bpreshuffle_auto_pad_enabled()
+    k_unaligned = x.shape[-1] % _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT != 0
+    # Only auto-pad N for "large" weights -- small N (<= alignment) goes
+    # through CK's small-tile instances that don't require alignment to
+    # the NPerBlock of 64+. The GLM-4.6V N values we need to fix are all
+    # in the thousands, well above this threshold. Without this guard
+    # tiny test fixtures (N=4, N=16, N=32) would silently bloat to 256
+    # rows and break tests that introspect ``aiter_padded_n``.
+    n_unaligned = (
+        x.shape[-2] > _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT
+        and x.shape[-2] % _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT != 0
+    )
+    if auto_pad and (k_unaligned or n_unaligned):
         global _auto_pad_warned
+        pad_align = _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT
+        new_k = (
+            ((x.shape[-1] + pad_align - 1) // pad_align) * pad_align
+            if k_unaligned
+            else x.shape[-1]
+        )
+        new_n = (
+            ((x.shape[-2] + pad_align - 1) // pad_align) * pad_align
+            if n_unaligned
+            else x.shape[-2]
+        )
         if not _auto_pad_warned:
             warnings.warn(
-                "[aiter] shuffle_weight auto-padded K from "
-                f"{x.shape[-1]} to next multiple of "
-                f"{_DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT}. Padded tail is zero. "
-                "Activations are auto-padded at gemm_a8w8_bpreshuffle. Disable "
-                "with AITER_BPRESHUFFLE_AUTO_PAD=0 (assertion mode) or tighten "
-                "with AITER_BPRESHUFFLE_PAD_ALIGNMENT=64 when the K-padding "
-                "CK patch is active. Suppressing further auto-pad warnings.",
+                "[aiter] shuffle_weight auto-padded "
+                f"K={x.shape[-1]}->{new_k}, N={x.shape[-2]}->{new_n} "
+                f"(next multiple of {pad_align}). Padded tails are zero; "
+                "activations are right-padded and outputs are left-sliced "
+                "inside gemm_a8w8_bpreshuffle. Disable with "
+                "AITER_BPRESHUFFLE_AUTO_PAD=0 (strict assertion mode) or "
+                "tighten the K alignment with "
+                "AITER_BPRESHUFFLE_PAD_ALIGNMENT=64 when the K-padding CK "
+                "patch is active. Suppressing further auto-pad warnings.",
                 stacklevel=2,
             )
             _auto_pad_warned = True
-        x = pad_weight_for_bpreshuffle(x, layout=layout)
+        # ``pad_n`` is gated by the magnitude threshold so small-N weights
+        # whose K trips ``k_unaligned`` don't get their N silently bloated.
+        x = pad_weight_for_bpreshuffle(x, layout=layout, pad_n=n_unaligned)
 
+    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
 
     x_ = x
