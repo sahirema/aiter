@@ -1,7 +1,108 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+import warnings
+from typing import Optional
+
 import torch
+
+
+# Tensor attribute names used by ``pad_weight_for_bpreshuffle`` and propagated
+# by ``shuffle_weight`` so downstream callers (e.g. SGLang's compressed-tensors
+# FP8 path) can detect padded weights without inspecting raw shapes.
+_BPRESHUFFLE_PADDING_ATTRS = ("aiter_original_k", "aiter_padded_k", "aiter_k_padding")
+
+# Default K alignment used when padding weights for the bpreshuffle GEMM. 256
+# covers all currently-shipping CK bpreshuffle BLOCK_K values for FP8 on
+# gfx950 regardless of whether the K-padding CK patch is active. With the
+# K-padding CK patch (composable_kernel branch ``glm4v-fp8-padding-ck``) the
+# floor drops to 64 (the MFMA K-per-slot atomic granularity); set
+# ``AITER_BPRESHUFFLE_PAD_ALIGNMENT=64`` to reduce the padded tail of GLM-4.6V
+# weights from up to 168 K-rows down to <=40. If a padded shape is then
+# rejected by ``IsSupportedArgument``, bump back to 256.
+_DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT = int(
+    os.environ.get("AITER_BPRESHUFFLE_PAD_ALIGNMENT", "256")
+)
+
+# Auto-padding controls whether ``shuffle_weight`` transparently pads K-dim
+# to ``_DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT`` when the input K is unaligned.
+# Default is on so SGLang's stock ``shuffle_weight(weight, (16, 16))`` call
+# in compressed_tensors_w8a8_fp8.py works for GLM-4.6V at TP={2,4,8} without
+# patching SGLang. Disable with ``AITER_BPRESHUFFLE_AUTO_PAD=0`` to restore
+# the strict K%BK==0 assertion behavior. Read inline so tests can flip the
+# env via ``monkeypatch.setenv`` without reloading the module.
+def _bpreshuffle_auto_pad_enabled() -> bool:
+    return os.environ.get("AITER_BPRESHUFFLE_AUTO_PAD", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
+
+
+# One-shot warning sentinel; we warn only the first time auto-pad fires per
+# process so logs stay clean for inference servers loading many layers.
+_auto_pad_warned = False
+
+
+def pad_weight_for_bpreshuffle(
+    x: torch.Tensor,
+    alignment: int = _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT,
+    layout=(16, 16),
+) -> torch.Tensor:
+    """Right-pad ``K`` (last dim) to a multiple of ``alignment`` with zeros.
+
+    Returns a contiguous tensor tagged with ``aiter_original_k``,
+    ``aiter_padded_k`` and ``aiter_k_padding`` metadata so downstream wrappers
+    can detect padding without inspecting shapes. The caller is responsible
+    for matching activation padding at runtime.
+
+    The padded tail is exactly zero, which keeps the FP8 GEMM result
+    mathematically identical for per-token / per-channel quantization
+    (``x_scale`` is per token and ``w_scale`` is per output channel, neither
+    is affected by padding the K dimension).
+
+    ``alignment=256`` covers all currently-shipping CK bpreshuffle ``BLOCK_K``
+    values for FP8 on gfx950. If a padded shape is still rejected by
+    ``IsSupportedArgument``, bump via ``AITER_BPRESHUFFLE_PAD_ALIGNMENT=512``
+    and rerun the tuner.
+
+    Memory peak during this helper is ``2 * sizeof(weight)`` because both ``x``
+    and ``out`` are live until return. Callers that load weights eagerly
+    should ``del`` the original tensor and call ``torch.cuda.empty_cache()``
+    once the returned tensor has been wrapped in a ``Parameter``.
+    """
+    if alignment <= 0:
+        raise ValueError(
+            f"pad_weight_for_bpreshuffle: alignment must be positive, got "
+            f"{alignment}"
+        )
+
+    original_k = x.shape[-1]
+    padded_k = ((original_k + alignment - 1) // alignment) * alignment
+    if padded_k == original_k:
+        out = x.contiguous()
+    else:
+        # ``torch.empty`` + targeted tail zero is cheaper than ``torch.zeros``
+        # because we avoid an unnecessary full zero pass over ``original_k``
+        # elements before overwriting them.
+        out = torch.empty(
+            *x.shape[:-1], padded_k, dtype=x.dtype, device=x.device
+        )
+        out[..., :original_k].copy_(x)
+        out[..., original_k:].zero_()
+    out.aiter_original_k = original_k
+    out.aiter_padded_k = padded_k
+    out.aiter_k_padding = padded_k - original_k
+    return out
+
+
+def _propagate_bpreshuffle_padding_attrs(
+    src: torch.Tensor, dst: torch.Tensor
+) -> None:
+    for attr in _BPRESHUFFLE_PADDING_ATTRS:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
 
 
 def shuffle_weight(
@@ -31,6 +132,7 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        _propagate_bpreshuffle_padding_attrs(x, x_)
         return x_
 
     IN, IK = layout
@@ -38,6 +140,32 @@ def shuffle_weight(
     K = 16 // x.element_size() if not use_int4 else 32
     BN = IN
     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
+
+    # Transparent K-padding for unaligned inputs (e.g. GLM-4.6V FP8 at TP=4/8
+    # has per-shard K=2736 / 1368 which trip the K%BK==0 assertion). We auto-
+    # pad here so SGLang's stock compressed-tensors path can call
+    # ``shuffle_weight(weight, (16, 16))`` directly without first invoking
+    # ``pad_weight_for_bpreshuffle``. Activation matching happens in
+    # ``gemm_a8w8_bpreshuffle``, which reads the ``aiter_padded_k`` metadata
+    # propagated by ``_propagate_bpreshuffle_padding_attrs`` below.
+    if _bpreshuffle_auto_pad_enabled() and (
+        x.shape[-1] % _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT != 0
+    ):
+        global _auto_pad_warned
+        if not _auto_pad_warned:
+            warnings.warn(
+                "[aiter] shuffle_weight auto-padded K from "
+                f"{x.shape[-1]} to next multiple of "
+                f"{_DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT}. Padded tail is zero. "
+                "Activations are auto-padded at gemm_a8w8_bpreshuffle. Disable "
+                "with AITER_BPRESHUFFLE_AUTO_PAD=0 (assertion mode) or tighten "
+                "with AITER_BPRESHUFFLE_PAD_ALIGNMENT=64 when the K-padding "
+                "CK patch is active. Suppressing further auto-pad warnings.",
+                stacklevel=2,
+            )
+            _auto_pad_warned = True
+        x = pad_weight_for_bpreshuffle(x, layout=layout)
+
     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
 
     x_ = x
@@ -47,7 +175,53 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    _propagate_bpreshuffle_padding_attrs(x, x_)
     return x_
+
+
+def is_bpreshuffle_kernel_tuned(
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    libtype: Optional[str] = None,
+    m_candidates: Optional[list] = None,
+) -> bool:
+    """Return True if the bpreshuffle tuned CSV has at least one entry that
+    matches ``(N=n, K=k, q_dtype_w=dtype)`` for the active GFX/CU.
+
+    Used by SGLang at weight-load time to decide whether to pad-and-shuffle
+    a weight (fast path) or fall back to the unshuffled
+    ``gemm_a8w8_CK`` kernel for that layer. Probing a representative set of
+    M values mirrors the M sweep used during tuning so layers whose tuned M
+    range is sparse still resolve to True.
+
+    ``libtype`` filters by the ``libtype`` column (e.g. ``"ck"``,
+    ``"cktile"``, ``"flydsl"``). Default of ``None`` returns True for any
+    libtype.
+    """
+    # Imported lazily to avoid an import cycle: ``gemm_op_a8w8`` imports from
+    # ``..jit.core`` which transitively imports many AIter ops.
+    from .gemm_op_a8w8 import get_GEMM_config_with_quant_type
+    from ..jit.core import AITER_CONFIGS
+
+    if m_candidates is None:
+        # Mirrors the SGLang graph-capture batch-size sweep documented in the
+        # GLM-4.6V FP8 padding plan.
+        m_candidates = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+
+    for m in m_candidates:
+        config = get_GEMM_config_with_quant_type(
+            m,
+            n,
+            k,
+            dtype,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        )
+        if config is None:
+            continue
+        if libtype is None or config.get("libtype") == libtype:
+            return True
+    return False
 
 
 def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:

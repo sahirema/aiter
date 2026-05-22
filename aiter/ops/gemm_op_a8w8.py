@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import Optional
 
 import pandas as pd
@@ -607,6 +608,40 @@ def gemm_a8w8_bpreshuffle(
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    # Transparent activation K-padding when WQ has the padding metadata
+    # propagated by ``shuffle_weight`` (auto-pad path) or stamped by
+    # ``pad_weight_for_bpreshuffle`` (opt-in path). The padded tail of WQ is
+    # exactly zero, so right-padding XQ with zeros to match preserves the
+    # mathematical result of the GEMM. We accept either an already-padded
+    # XQ (caller did the work) or an unpadded XQ matching the original K.
+    weight_original_k = getattr(WQ, "aiter_original_k", WQ.shape[-1])
+    weight_padded_k = getattr(WQ, "aiter_padded_k", WQ.shape[-1])
+    if weight_padded_k != weight_original_k and XQ.shape[-1] != weight_padded_k:
+        if XQ.shape[-1] != weight_original_k:
+            raise AssertionError(
+                f"WQ was padded from K={weight_original_k} to K={weight_padded_k}; "
+                f"XQ.shape[-1]={XQ.shape[-1]} must be either {weight_original_k} "
+                f"(will be auto-padded) or {weight_padded_k} (already padded). "
+                "Disable auto-padding with AITER_BPRESHUFFLE_AUTO_PAD=0."
+            )
+        if os.environ.get("AITER_BPRESHUFFLE_AUTO_PAD", "1") in ("0", "false", "False"):
+            raise AssertionError(
+                f"WQ was padded to K={weight_padded_k} but auto-pad is disabled "
+                f"(AITER_BPRESHUFFLE_AUTO_PAD=0); XQ.shape[-1]={XQ.shape[-1]} "
+                f"must already equal {weight_padded_k}."
+            )
+        XQ = torch.nn.functional.pad(
+            XQ, (0, weight_padded_k - XQ.shape[-1]), value=0
+        )
+
+    # Unconditional shape check -- protects against silent shape drift even
+    # when padding metadata is absent (e.g., torch.nn.Parameter wrapping
+    # strips tensor.__dict__).
+    assert XQ.shape[-1] == WQ.shape[-1], (
+        f"gemm_a8w8_bpreshuffle requires XQ.shape[-1] == WQ.shape[-1], got "
+        f"XQ.shape[-1]={XQ.shape[-1]}, WQ.shape[-1]={WQ.shape[-1]}"
+    )
+
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
