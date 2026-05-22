@@ -9,6 +9,12 @@ trip the shuffle-weight K-divisibility assertion and/or the
 ``IsSupportedArgument`` rejection inside the bpreshuffle kernel. They run
 on CPU-only for the metadata/regression cases and require CUDA for the GEMM
 correctness cases.
+
+N-unaligned weights (e.g. GLM-4.6V FP8 gate_up_proj at TP={4,8}) are handled
+directly inside the bpreshuffle gridwise kernel by the
+``glm4v-fp8-padding-ck`` patch via ``MakeBGridDescriptor_Preshuffled``'s
+N-padding branch -- nothing for AIter to test on the N axis beyond ``the
+GEMM works end-to-end``, which the unaligned-N GEMM test below covers.
 """
 
 from __future__ import annotations
@@ -34,18 +40,8 @@ GLM_K_PADDED_TO_UNPADDED = {
     "tp2_other": (6144, 6144),
 }
 
-# (TP, role, original_n): padded_n. These are the gate_up_proj per-TP shard
-# sizes that hit ``RuntimeError: This GEMM is not supported!`` from CK at
-# TP=4/8 because no bpreshuffle instance has an NPerBlock dividing them.
-GLM_N_PADDED_TO_UNPADDED = {
-    "tp8_gate_up": (2736, 2816),
-    "tp4_gate_up": (5472, 5632),
-    "tp2_gate_up": (10944, 11008),  # 10944 % 256 == 192 -> next mult is 11008
-}
-
 ALIGNED_K_VALUES = (4096, 1024, 1536, 2048, 3072)
 PADDED_K_VALUES = (1368, 2736, 5472)
-PADDED_N_VALUES = (2736, 5472)
 NON_FP8_DTYPES = (torch.bfloat16, torch.float16, torch.int8)
 
 
@@ -192,70 +188,21 @@ def test_shuffle_weight_aligned_input_has_no_padding_attrs():
     assert not hasattr(shuffled, "aiter_original_k")
     assert not hasattr(shuffled, "aiter_padded_k")
     assert not hasattr(shuffled, "aiter_k_padding")
-    assert not hasattr(shuffled, "aiter_original_n")
-    assert not hasattr(shuffled, "aiter_padded_n")
 
 
-# --- N-axis padding ------------------------------------------------------ #
-
-
-@pytest.mark.parametrize(
-    "case",
-    list(GLM_N_PADDED_TO_UNPADDED.values()),
-    ids=[k for k in GLM_N_PADDED_TO_UNPADDED],
-)
-def test_pad_weight_n_dim(case):
-    """``pad_weight_for_bpreshuffle(..., pad_n=True)`` pads N up to the
-    alignment with zero rows and stamps the matching ``aiter_*_n`` attrs.
-    """
-    original_n, padded_n = case
-    k = 4096
-    w = torch.randn((original_n, k), dtype=torch.bfloat16)
-    out = pad_weight_for_bpreshuffle(w, pad_n=True)
-    assert out.shape == (padded_n, k)
-    assert out.aiter_original_n == original_n
-    assert out.aiter_padded_n == padded_n
-    assert out.aiter_n_padding == padded_n - original_n
-    # K untouched in these cases (k=4096 already aligned).
-    assert out.aiter_original_k == k
-    assert out.aiter_padded_k == k
-    # Head must equal input bit-for-bit, tail must be exactly zero.
-    assert torch.equal(out[:original_n, :], w)
-    if padded_n > original_n:
-        assert torch.all(out[original_n:, :] == 0)
-
-
-def test_pad_weight_both_n_and_k():
-    """Edge case: a weight unaligned on both axes must get both axes padded
-    in a single ``pad_weight_for_bpreshuffle(pad_n=True)`` call."""
-    w = torch.randn((2736, 5472), dtype=torch.bfloat16)  # N and K both unaligned
-    out = pad_weight_for_bpreshuffle(w, pad_n=True)
-    assert out.shape == (2816, 5632)
-    assert out.aiter_original_n == 2736 and out.aiter_padded_n == 2816
-    assert out.aiter_original_k == 5472 and out.aiter_padded_k == 5632
-    assert torch.equal(out[:2736, :5472], w)
-    assert torch.all(out[2736:, :] == 0)
-    assert torch.all(out[:, 5472:] == 0)
-
-
-@pytest.mark.parametrize("original_n", PADDED_N_VALUES)
-def test_shuffle_weight_auto_pads_unaligned_n(original_n, monkeypatch):
-    """When N is unaligned, ``shuffle_weight`` must auto-pad N too. This
-    is what unblocks GLM-4.6V FP8 gate_up_proj at TP={4,8}, whose per-TP
-    N values (5472 and 2736) don't match any CK bpreshuffle instance."""
+def test_shuffle_weight_unaligned_n_passes_through(monkeypatch):
+    """N-unaligned weights are NOT padded by AIter -- the CK
+    ``glm4v-fp8-padding-ck`` patch handles N padding inside the bpreshuffle
+    gridwise kernel. Verify ``shuffle_weight`` leaves the N dim alone."""
     monkeypatch.setenv("AITER_BPRESHUFFLE_AUTO_PAD", "1")
-    k = 4096  # aligned; we want to isolate the N path
-    w = torch.randn((original_n, k), dtype=torch.bfloat16)
+    # K aligned, N unaligned (GLM-4.6V FP8 TP=4 gate_up_proj shape)
+    w = torch.randn((5472, 4096), dtype=torch.bfloat16)
     shuffled = shuffle_weight(w, layout=(16, 16))
-    expected_n = (
-        (original_n + _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT - 1)
-        // _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT
-    ) * _DEFAULT_BPRESHUFFLE_PAD_ALIGNMENT
-    assert shuffled.shape[-2] == expected_n
-    assert shuffled.shape[-1] == k
-    assert shuffled.aiter_original_n == original_n
-    assert shuffled.aiter_padded_n == expected_n
-    assert getattr(shuffled, "is_shuffled", False) is True
+    assert shuffled.shape == (5472, 4096), (
+        "AIter must NOT pad N -- CK's N-pad GemmSpec branch handles it"
+    )
+    # No K-padding metadata either since K is already aligned.
+    assert not hasattr(shuffled, "aiter_padded_k")
 
 
 # --- storage-keyed sidecar: survives nn.Parameter wrapping ---------------- #
@@ -274,31 +221,15 @@ def test_metadata_survives_parameter_wrap_k(original_k):
     # Confirm the attribute channel is dead (the regression we are fixing).
     assert not hasattr(param, "aiter_original_k")
     assert not hasattr(param, "aiter_padded_k")
-    # The sidecar must still recover the metadata for the Parameter.
+    # The sidecar must still recover the K-padding metadata for the Parameter.
     side = _lookup_bpreshuffle_padding(param)
     assert side is not None, (
         "storage-keyed sidecar lookup failed after nn.Parameter wrap; "
         "the bpreshuffle GEMM path will not know to auto-pad XQ."
     )
-    sok, spk, son, spn = side
+    sok, spk = side
     assert sok == original_k
     assert spk == shuffled.aiter_padded_k
-
-
-@pytest.mark.parametrize("original_n", PADDED_N_VALUES)
-def test_metadata_survives_parameter_wrap_n(original_n):
-    """Same as above but for N-padding."""
-    k = 4096
-    w = torch.randn((original_n, k), dtype=torch.bfloat16)
-    shuffled = shuffle_weight(w, layout=(16, 16))
-    assert shuffled.aiter_padded_n > original_n
-
-    param = torch.nn.Parameter(shuffled, requires_grad=False)
-    side = _lookup_bpreshuffle_padding(param)
-    assert side is not None
-    sok, spk, son, spn = side
-    assert son == original_n
-    assert spn == shuffled.aiter_padded_n
 
 
 def test_registry_does_not_register_aligned_weights():
@@ -307,14 +238,13 @@ def test_registry_does_not_register_aligned_weights():
     guard so we don't accidentally degrade the aligned path."""
     before = len(_BPRESHUFFLE_PAD_REGISTRY)
     w = torch.randn((4096, 4096), dtype=torch.bfloat16)
-    out = pad_weight_for_bpreshuffle(w, pad_n=True)
+    out = pad_weight_for_bpreshuffle(w)
     assert _lookup_bpreshuffle_padding(out) is None
-    # And neither padding path inserted a registry entry.
     assert len(_BPRESHUFFLE_PAD_REGISTRY) == before
 
 
 def test_registry_rejects_stale_entry_on_shape_mismatch():
-    """If a registry entry's recorded ``padded_*`` no longer matches the
+    """If a registry entry's recorded ``padded_k`` no longer matches the
     tensor's current shape, ``_lookup_bpreshuffle_padding`` returns None.
     This is the guard against a freed-storage data_ptr being reused for
     an unrelated tensor with a different shape."""
@@ -324,7 +254,6 @@ def test_registry_rejects_stale_entry_on_shape_mismatch():
     # Fabricate a stale registry entry by overwriting the shape data via
     # ``.view`` -- the underlying storage is shared but the shape changes.
     reshaped = out.view(-1, out.shape[-1] // 2)
-    # The sidecar must refuse to return the entry for the reshaped tensor.
     assert _lookup_bpreshuffle_padding(reshaped) is None
 
 
@@ -503,6 +432,9 @@ def test_padded_weight_unpadded_activation_raises_when_auto_pad_disabled(
         )
 
 
+# --- CK-side N-padding: verify the GEMM accepts unaligned N -------------- #
+
+
 @pytest.mark.parametrize(
     "m,n,k",
     [
@@ -511,13 +443,15 @@ def test_padded_weight_unpadded_activation_raises_when_auto_pad_disabled(
         (64, 5472, 4096),   # GLM-4.6V FP8 at higher batch (matches tp4.log)
     ],
 )
-def test_n_padded_bpreshuffle_returns_unpadded_shape(aiter_module, m, n, k):
-    """End-to-end N-padding: a weight with unaligned N goes through
-    ``shuffle_weight`` (auto-pad enabled), the GEMM is dispatched against
-    the padded N, and the wrapper slices the output back to the original
-    ``n``. This is the path that unblocks GLM-4.6V FP8 gate_up_proj at
-    TP={4,8} -- before this fix the kernel raised
-    ``RuntimeError: This GEMM is not supported!``."""
+def test_unaligned_n_bpreshuffle_end_to_end(aiter_module, m, n, k):
+    """End-to-end N-unaligned path with the ``glm4v-fp8-padding-ck`` patch:
+    ``shuffle_weight`` does NOT pad N (it just shuffles in place), the
+    bpreshuffle GEMM dispatches under MNKPadding GemmSpec, CK's gridwise
+    right-pads N0 internally and returns an exactly-``(M, N)`` output. No
+    AIter-side slicing involved.
+
+    Before the CK patch the kernel raised
+    ``RuntimeError: This GEMM is not supported!`` for these N values."""
     aiter = aiter_module
 
     torch.manual_seed(0)
@@ -529,9 +463,10 @@ def test_n_padded_bpreshuffle_returns_unpadded_shape(aiter_module, m, n, k):
     wq, w_scale = _fp8_perchannel_quant(w_bf16)
 
     shuffled = shuffle_weight(wq, layout=(16, 16))
-    # Sanity: this only exercises N-padding when N is actually unaligned.
-    if getattr(shuffled, "aiter_padded_n", n) == n:
-        pytest.skip(f"expected N={n} to need padding for this test")
+    # Confirm AIter is NOT padding N -- that's CK's job now.
+    assert shuffled.shape == (n, k), (
+        f"expected shuffle_weight to leave N alone; got {shuffled.shape}"
+    )
 
     try:
         out = aiter.gemm_a8w8_bpreshuffle(
@@ -539,93 +474,14 @@ def test_n_padded_bpreshuffle_returns_unpadded_shape(aiter_module, m, n, k):
         )
     except RuntimeError as e:
         pytest.skip(
-            f"bpreshuffle kernel rejected N-padded shape "
-            f"(M={m}, N_padded={shuffled.aiter_padded_n}, K={k}). "
-            f"Underlying error: {e}"
+            f"bpreshuffle kernel rejected N-unaligned shape "
+            f"(M={m}, N={n}, K={k}); is the ``glm4v-fp8-padding-ck`` CK "
+            f"patch built in? Underlying error: {e}"
         )
 
-    # The GEMM was dispatched against (M, padded_N, K) but the wrapper
-    # must slice back to (M, original_N) before returning so downstream
-    # layers see the shape they expect.
     assert out.shape == (m, n), (
-        f"output shape must be sliced back to original N; got {out.shape}, "
-        f"expected ({m}, {n})"
+        f"output shape mismatch; got {out.shape}, expected ({m}, {n})"
     )
 
     ref = _torch_reference(xq, wq, x_scale, w_scale, torch.bfloat16)
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-def test_n_padded_bpreshuffle_with_parameter_wrap(aiter_module):
-    """Regression guard for the failure mode actually seen in
-    ``tp4.log`` / ``tp8.log``: ``shuffle_weight`` produces a tensor whose
-    padding metadata is then stripped by ``torch.nn.Parameter`` wrapping.
-    The sidecar must recover the metadata so XQ K-pad and Y N-unpad both
-    still fire even though ``hasattr(WQ, 'aiter_padded_k')`` is False."""
-    aiter = aiter_module
-
-    torch.manual_seed(0)
-    device = "cuda"
-    # Pick a shape that needs both K and N padding so we cover both paths
-    # through the Parameter wrap in a single test.
-    m, n, k = 16, 5472, 2736
-    x_bf16 = torch.randn((m, k), dtype=torch.bfloat16, device=device)
-    w_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device=device)
-
-    xq, x_scale = _fp8_perchannel_quant(x_bf16)
-    wq, w_scale = _fp8_perchannel_quant(w_bf16)
-
-    shuffled = shuffle_weight(wq, layout=(16, 16))
-    assert shuffled.aiter_padded_k > k and shuffled.aiter_padded_n > n
-    param = torch.nn.Parameter(shuffled, requires_grad=False)
-    # Confirm the failure mode the sidecar guards against: attrs gone.
-    assert not hasattr(param, "aiter_padded_k")
-    assert not hasattr(param, "aiter_padded_n")
-
-    try:
-        out = aiter.gemm_a8w8_bpreshuffle(
-            xq, param, x_scale, w_scale, None, torch.bfloat16
-        )
-    except RuntimeError as e:
-        pytest.skip(
-            f"bpreshuffle kernel rejected (M={m}, "
-            f"N_padded={shuffled.aiter_padded_n}, "
-            f"K_padded={shuffled.aiter_padded_k}). Underlying error: {e}"
-        )
-
-    assert out.shape == (m, n)
-    ref = _torch_reference(xq, wq, x_scale, w_scale, torch.bfloat16)
-    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-def test_n_padded_bpreshuffle_pads_w_scale(aiter_module):
-    """The N-padding path must also pad ``w_scale`` so the kernel's
-    per-channel scale lookup is in-bounds for the padded N tail. Verify
-    by running the GEMM with an explicitly-unpadded ``w_scale`` (the
-    SGLang path) and confirming the output matches a reference where we
-    pad ``w_scale`` manually."""
-    aiter = aiter_module
-
-    torch.manual_seed(0)
-    device = "cuda"
-    m, n, k = 16, 2736, 4096
-    x_bf16 = torch.randn((m, k), dtype=torch.bfloat16, device=device)
-    w_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device=device)
-
-    xq, x_scale = _fp8_perchannel_quant(x_bf16)
-    wq, w_scale = _fp8_perchannel_quant(w_bf16)
-
-    shuffled = shuffle_weight(wq, layout=(16, 16))
-    if getattr(shuffled, "aiter_padded_n", n) == n:
-        pytest.skip(f"expected N={n} to need padding for this test")
-
-    try:
-        out_auto = aiter.gemm_a8w8_bpreshuffle(
-            xq, shuffled, x_scale, w_scale, None, torch.bfloat16
-        )
-    except RuntimeError as e:
-        pytest.skip(f"bpreshuffle kernel rejected: {e}")
-
-    assert out_auto.shape == (m, n)
-    ref = _torch_reference(xq, wq, x_scale, w_scale, torch.bfloat16)
-    torch.testing.assert_close(out_auto, ref, rtol=1e-2, atol=1e-2)

@@ -622,41 +622,34 @@ def gemm_a8w8_bpreshuffle(
         torch.float16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
 
-    # ---- padding-metadata recovery -------------------------------------- #
+    # ---- K-padding metadata recovery ------------------------------------ #
     #
     # ``shuffle_weight`` (auto-pad path) or ``pad_weight_for_bpreshuffle``
-    # (opt-in path) may have padded WQ on K (input contraction dim) and/or
-    # N (output dim) to make GLM-4.6V-shaped weights fit the bpreshuffle
-    # dispatch table. The metadata is stamped both on the tensor as
-    # ``aiter_*`` attrs and in a storage-keyed sidecar registry; the latter
-    # is the channel that survives ``torch.nn.Parameter`` wrapping (which
-    # SGLang's compressed-tensors path does to every shuffled weight). We
-    # try attrs first because the lookup is free; fall back to the
-    # registry otherwise.
+    # (opt-in path) may have padded WQ on K (input contraction dim) to make
+    # GLM-4.6V-shaped weights fit the bpreshuffle dispatch table. The
+    # metadata is stamped both on the tensor as ``aiter_*`` attrs and in a
+    # storage-keyed sidecar registry; the latter is the channel that
+    # survives ``torch.nn.Parameter`` wrapping (which SGLang's
+    # compressed-tensors path does to every shuffled weight). We try attrs
+    # first because the lookup is free; fall back to the registry otherwise.
+    #
+    # N-padding is intentionally NOT handled here: the CK
+    # ``glm4v-fp8-padding-ck`` patch makes the bpreshuffle gridwise kernel
+    # accept any N via right-padding inside ``MakeBGridDescriptor_Preshuffled``
+    # under N-padding GemmSpec, and the C-side descriptor's
+    # ``make_right_pad_transform`` drops OOB writes. The kernel produces an
+    # exactly-``(M, N)`` output without any AIter-side N pad/unpad.
     from .shuffle import _lookup_bpreshuffle_padding
 
     weight_original_k = getattr(WQ, "aiter_original_k", None)
     weight_padded_k = getattr(WQ, "aiter_padded_k", None)
-    weight_original_n = getattr(WQ, "aiter_original_n", None)
-    weight_padded_n = getattr(WQ, "aiter_padded_n", None)
-    if weight_original_k is None or weight_original_n is None:
+    if weight_original_k is None:
         side = _lookup_bpreshuffle_padding(WQ)
         if side is not None:
-            sok, spk, son, spn = side
-            if weight_original_k is None:
-                weight_original_k = sok
-            if weight_padded_k is None:
-                weight_padded_k = spk
-            if weight_original_n is None:
-                weight_original_n = son
-            if weight_padded_n is None:
-                weight_padded_n = spn
+            weight_original_k, weight_padded_k = side
     if weight_original_k is None:
         weight_original_k = WQ.shape[-1]
         weight_padded_k = WQ.shape[-1]
-    if weight_original_n is None:
-        weight_original_n = WQ.shape[-2]
-        weight_padded_n = WQ.shape[-2]
 
     auto_pad_disabled = os.environ.get(
         "AITER_BPRESHUFFLE_AUTO_PAD", "1"
@@ -688,49 +681,6 @@ def gemm_a8w8_bpreshuffle(
             XQ, (0, weight_padded_k - XQ.shape[-1]), value=0
         )
 
-    # ---- w_scale N-padding --------------------------------------------- #
-    #
-    # When WQ is N-padded, the corresponding ``w_scale`` (per-output-channel
-    # scale) must be extended to match. Concretely:
-    #
-    #   Y[m, j] = sum_k XQ[m, k] * WQ[j, k] * x_scale[m] * w_scale[j]
-    #
-    # For ``j >= original_n``, ``WQ[j, :] == 0`` (the N-pad tail), so
-    # ``Y[m, j] == 0`` regardless of ``w_scale[j]``. We can therefore pad
-    # ``w_scale`` with any value; zeros are the obvious "this entry should
-    # never contribute" sentinel.
-    #
-    # ``w_scale`` shape conventions in AIter: typically ``(N,)`` for the
-    # vector form or ``(N, 1)`` for the 2-D form. We dispatch on which
-    # axis equals ``original_n`` so both shapes work without the caller
-    # having to normalise.
-    if weight_padded_n != weight_original_n:
-        pad_amount = weight_padded_n - weight_original_n
-        if w_scale.ndim == 1 and w_scale.shape[0] == weight_original_n:
-            w_scale = torch.nn.functional.pad(
-                w_scale, (0, pad_amount), value=0
-            )
-        elif w_scale.ndim >= 2 and w_scale.shape[-2] == weight_original_n:
-            # ``F.pad`` arg order is innermost-dim-first; for a 2-D tensor
-            # ``(left_dim_-1, right_dim_-1, left_dim_-2, right_dim_-2)``.
-            w_scale = torch.nn.functional.pad(
-                w_scale, (0, 0, 0, pad_amount), value=0
-            )
-        elif (
-            (w_scale.ndim == 1 and w_scale.shape[0] == weight_padded_n)
-            or (w_scale.ndim >= 2 and w_scale.shape[-2] == weight_padded_n)
-        ):
-            pass  # already padded by caller
-        else:
-            raise AssertionError(
-                f"WQ was N-padded from {weight_original_n} to "
-                f"{weight_padded_n}; could not infer which axis of w_scale "
-                f"(shape {tuple(w_scale.shape)}) carries N. Expected the "
-                "leading dim of a 1-D w_scale, or the second-to-last dim "
-                "of a 2-D w_scale, to equal either "
-                f"{weight_original_n} or {weight_padded_n}."
-            )
-
     # Unconditional shape check -- a final guard against any silent shape
     # drift the recovery path above might miss (stale registry entry, an
     # unexpected wrapper that mutates ``.shape``, etc.).
@@ -756,17 +706,6 @@ def gemm_a8w8_bpreshuffle(
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    # ``_unpad_output`` slices the GEMM result back to ``original_n`` when
-    # WQ was N-padded. The padded tail rows of Y are guaranteed zero (since
-    # WQ tail rows are zero) and discarded here so downstream layers see
-    # the unpadded ``(M, original_n)`` shape they expect.
-    needs_n_unpad = weight_padded_n != weight_original_n
-
-    def _unpad_output(y: Tensor) -> Tensor:
-        if needs_n_unpad:
-            return y[..., :weight_original_n].contiguous()
-        return y
-
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
         m,
@@ -779,21 +718,17 @@ def gemm_a8w8_bpreshuffle(
         libtype = config["libtype"]
         splitK = int(config["splitK"])
         if libtype == "ck":
-            return _unpad_output(
-                gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
-            )
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
-            return _unpad_output(
-                gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+            return gemm_a8w8_bpreshuffle_cktile(
+                XQ, WQ, x_scale, w_scale, Y, splitK
             )
         elif libtype == "flydsl" and is_flydsl_available():
-            return _unpad_output(
-                gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            return gemm_a8w8_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config
             )
     try:
-        return _unpad_output(
-            gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
-        )
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
