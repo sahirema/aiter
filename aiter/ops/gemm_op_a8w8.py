@@ -608,35 +608,119 @@ def gemm_a8w8_bpreshuffle(
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    # Transparent activation K-padding when WQ has the padding metadata
-    # propagated by ``shuffle_weight`` (auto-pad path) or stamped by
-    # ``pad_weight_for_bpreshuffle`` (opt-in path). The padded tail of WQ is
-    # exactly zero, so right-padding XQ with zeros to match preserves the
-    # mathematical result of the GEMM. We accept either an already-padded
-    # XQ (caller did the work) or an unpadded XQ matching the original K.
-    weight_original_k = getattr(WQ, "aiter_original_k", WQ.shape[-1])
-    weight_padded_k = getattr(WQ, "aiter_padded_k", WQ.shape[-1])
+
+    # ---- padding-metadata recovery -------------------------------------- #
+    #
+    # ``shuffle_weight`` (auto-pad path) or ``pad_weight_for_bpreshuffle``
+    # (opt-in path) may have padded WQ on K (input contraction dim) and/or
+    # N (output dim) to make GLM-4.6V-shaped weights fit the bpreshuffle
+    # dispatch table. The metadata is stamped both on the tensor as
+    # ``aiter_*`` attrs and in a storage-keyed sidecar registry; the latter
+    # is the channel that survives ``torch.nn.Parameter`` wrapping (which
+    # SGLang's compressed-tensors path does to every shuffled weight). We
+    # try attrs first because the lookup is free; fall back to the
+    # registry otherwise.
+    from .shuffle import _lookup_bpreshuffle_padding
+
+    weight_original_k = getattr(WQ, "aiter_original_k", None)
+    weight_padded_k = getattr(WQ, "aiter_padded_k", None)
+    weight_original_n = getattr(WQ, "aiter_original_n", None)
+    weight_padded_n = getattr(WQ, "aiter_padded_n", None)
+    if weight_original_k is None or weight_original_n is None:
+        side = _lookup_bpreshuffle_padding(WQ)
+        if side is not None:
+            sok, spk, son, spn = side
+            if weight_original_k is None:
+                weight_original_k = sok
+            if weight_padded_k is None:
+                weight_padded_k = spk
+            if weight_original_n is None:
+                weight_original_n = son
+            if weight_padded_n is None:
+                weight_padded_n = spn
+    if weight_original_k is None:
+        weight_original_k = WQ.shape[-1]
+        weight_padded_k = WQ.shape[-1]
+    if weight_original_n is None:
+        weight_original_n = WQ.shape[-2]
+        weight_padded_n = WQ.shape[-2]
+
+    auto_pad_disabled = os.environ.get(
+        "AITER_BPRESHUFFLE_AUTO_PAD", "1"
+    ) in ("0", "false", "False")
+
+    # ---- XQ K-padding --------------------------------------------------- #
+    #
+    # WQ has padded K; XQ may arrive at either ``original_k`` (unpadded;
+    # the SGLang activation path) or ``padded_k`` (caller did the work).
+    # The padded tail of WQ is exactly zero so right-padding XQ with zeros
+    # is mathematically identical to extending the K dimension.
     if weight_padded_k != weight_original_k and XQ.shape[-1] != weight_padded_k:
         if XQ.shape[-1] != weight_original_k:
             raise AssertionError(
-                f"WQ was padded from K={weight_original_k} to K={weight_padded_k}; "
-                f"XQ.shape[-1]={XQ.shape[-1]} must be either {weight_original_k} "
-                f"(will be auto-padded) or {weight_padded_k} (already padded). "
-                "Disable auto-padding with AITER_BPRESHUFFLE_AUTO_PAD=0."
+                f"WQ was padded from K={weight_original_k} to "
+                f"K={weight_padded_k}; XQ.shape[-1]={XQ.shape[-1]} must be "
+                f"either {weight_original_k} (will be auto-padded) or "
+                f"{weight_padded_k} (already padded). Disable auto-padding "
+                "with AITER_BPRESHUFFLE_AUTO_PAD=0."
             )
-        if os.environ.get("AITER_BPRESHUFFLE_AUTO_PAD", "1") in ("0", "false", "False"):
+        if auto_pad_disabled:
             raise AssertionError(
-                f"WQ was padded to K={weight_padded_k} but auto-pad is disabled "
-                f"(AITER_BPRESHUFFLE_AUTO_PAD=0); XQ.shape[-1]={XQ.shape[-1]} "
-                f"must already equal {weight_padded_k}."
+                f"WQ was padded to K={weight_padded_k} but auto-pad is "
+                f"disabled (AITER_BPRESHUFFLE_AUTO_PAD=0); "
+                f"XQ.shape[-1]={XQ.shape[-1]} must already equal "
+                f"{weight_padded_k}."
             )
         XQ = torch.nn.functional.pad(
             XQ, (0, weight_padded_k - XQ.shape[-1]), value=0
         )
 
-    # Unconditional shape check -- protects against silent shape drift even
-    # when padding metadata is absent (e.g., torch.nn.Parameter wrapping
-    # strips tensor.__dict__).
+    # ---- w_scale N-padding --------------------------------------------- #
+    #
+    # When WQ is N-padded, the corresponding ``w_scale`` (per-output-channel
+    # scale) must be extended to match. Concretely:
+    #
+    #   Y[m, j] = sum_k XQ[m, k] * WQ[j, k] * x_scale[m] * w_scale[j]
+    #
+    # For ``j >= original_n``, ``WQ[j, :] == 0`` (the N-pad tail), so
+    # ``Y[m, j] == 0`` regardless of ``w_scale[j]``. We can therefore pad
+    # ``w_scale`` with any value; zeros are the obvious "this entry should
+    # never contribute" sentinel.
+    #
+    # ``w_scale`` shape conventions in AIter: typically ``(N,)`` for the
+    # vector form or ``(N, 1)`` for the 2-D form. We dispatch on which
+    # axis equals ``original_n`` so both shapes work without the caller
+    # having to normalise.
+    if weight_padded_n != weight_original_n:
+        pad_amount = weight_padded_n - weight_original_n
+        if w_scale.ndim == 1 and w_scale.shape[0] == weight_original_n:
+            w_scale = torch.nn.functional.pad(
+                w_scale, (0, pad_amount), value=0
+            )
+        elif w_scale.ndim >= 2 and w_scale.shape[-2] == weight_original_n:
+            # ``F.pad`` arg order is innermost-dim-first; for a 2-D tensor
+            # ``(left_dim_-1, right_dim_-1, left_dim_-2, right_dim_-2)``.
+            w_scale = torch.nn.functional.pad(
+                w_scale, (0, 0, 0, pad_amount), value=0
+            )
+        elif (
+            (w_scale.ndim == 1 and w_scale.shape[0] == weight_padded_n)
+            or (w_scale.ndim >= 2 and w_scale.shape[-2] == weight_padded_n)
+        ):
+            pass  # already padded by caller
+        else:
+            raise AssertionError(
+                f"WQ was N-padded from {weight_original_n} to "
+                f"{weight_padded_n}; could not infer which axis of w_scale "
+                f"(shape {tuple(w_scale.shape)}) carries N. Expected the "
+                "leading dim of a 1-D w_scale, or the second-to-last dim "
+                "of a 2-D w_scale, to equal either "
+                f"{weight_original_n} or {weight_padded_n}."
+            )
+
+    # Unconditional shape check -- a final guard against any silent shape
+    # drift the recovery path above might miss (stale registry entry, an
+    # unexpected wrapper that mutates ``.shape``, etc.).
     assert XQ.shape[-1] == WQ.shape[-1], (
         f"gemm_a8w8_bpreshuffle requires XQ.shape[-1] == WQ.shape[-1], got "
         f"XQ.shape[-1]={XQ.shape[-1]}, WQ.shape[-1]={WQ.shape[-1]}"
@@ -659,6 +743,17 @@ def gemm_a8w8_bpreshuffle(
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
+    # ``_unpad_output`` slices the GEMM result back to ``original_n`` when
+    # WQ was N-padded. The padded tail rows of Y are guaranteed zero (since
+    # WQ tail rows are zero) and discarded here so downstream layers see
+    # the unpadded ``(M, original_n)`` shape they expect.
+    needs_n_unpad = weight_padded_n != weight_original_n
+
+    def _unpad_output(y: Tensor) -> Tensor:
+        if needs_n_unpad:
+            return y[..., :weight_original_n].contiguous()
+        return y
+
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
         m,
@@ -671,13 +766,21 @@ def gemm_a8w8_bpreshuffle(
         libtype = config["libtype"]
         splitK = int(config["splitK"])
         if libtype == "ck":
-            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
+            return _unpad_output(
+                gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
+            )
         elif libtype == "cktile":
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+            return _unpad_output(
+                gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+            )
         elif libtype == "flydsl" and is_flydsl_available():
-            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            return _unpad_output(
+                gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            )
     try:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
+        return _unpad_output(
+            gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
+        )
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
