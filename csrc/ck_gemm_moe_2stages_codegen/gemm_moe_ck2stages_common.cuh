@@ -252,7 +252,19 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    // [glm4v-fp8-padding-auto-moe] Stage-2 down-projection of per-token FP8
+    // MoE: K = per-rank intermediate, which is padded by SGLang's
+    // ``get_moe_weight_sizes`` to a multiple of 128 (AITER_PADDING_SIZE) --
+    // not necessarily a multiple of CK's KPerBlock (256 in tuned configs).
+    // GLM-4.6V FP8 at TP=4 lands on K=384, which the ``Default`` GemmSpec
+    // rejects via ``DeviceMoeGemm::IsSupportedArgument``. Switching to
+    // ``KPadding`` opts the gridwise into the K-tail zero-pad branch CK
+    // already implements -- functionally identical for aligned K (KPad == K),
+    // mathematically exact for unaligned K (FP8 weight tail is zero post-
+    // shuffle, activation tail is zero post-XQ-pad). Stage-1 left at
+    // ``Default`` since its K = hidden_dim is always aligned across all
+    // model configs that reach this kernel.
+    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::KPadding;
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES               = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL            = 16;
