@@ -1,8 +1,11 @@
 # The flydsl NULL-stream default: mechanism, scope, and what is actually at risk
 
-`stream: fx.Stream = fx.Stream(None)` appears as a launcher default in 40 places across 17
-flydsl kernel modules. This note records what that default does, why it fails silently, which
-sites were actually audited, and what the fix is. It is a report, not a code change.
+`Stream(None)` appears at 40 sites across 17 modules — 16 flydsl kernel modules plus
+`aiter/ops/triton/gluon/pa_decode_gluon.py`. Calling all 40 "a launcher default" overstates it:
+by form they are ~21 parameter defaults, 8 inverse guards, 7 explicit passes or local bindings,
+and 4 comment lines (two of which are the CRITICAL comment quoted in §1). This note records what
+the NULL stream does, why it fails silently, which sites were actually audited, and what the fix
+is. It is a report, not a code change.
 
 ## TL;DR
 
@@ -75,9 +78,10 @@ wrapper rather than in the kernels module:
 | `fused_compress_attn_hca.py` | 3 | — |
 | `fused_compress_attn_hca_gfx1250.py` | 2 | — |
 | `qk_norm_rope_quant.py` | 2 | — |
-| `moe_sorting_kernel.py` | 2 | — |
+| `moe_sorting_kernel.py` | 2 real, **plus 8 inverse** (see §4) | — |
 | `gemm_a16w16_gfx950.py` | 1 | — |
 | `dcp_topk_merge.py` | 0 | 2 (`aiter/ops/flydsl/dcp_topk_merge.py:161`) |
+| `pa_decode_gluon.py` (not flydsl) | n/a — default already removed, passed explicitly at `:5136` | — |
 | `mla_reduce.py`, `moe_route_maps.py`, `moe_contiguous_psum.py`, `moe_g2l_lut.py`, `moe_gather_reduce.py`, `moe_fused_route_quant_scatter.py`, `flash_attn_func_gfx1201.py`, `flydsl_dispatch_combine_intranode_kernel.py`, `mega_moe_gfx1250/{combine,dispatch}.py` | 0 | not co-located; unaudited |
 
 `dcp_topk_merge` is the reason the raw count cannot be trusted: its kernels file has no guard at
@@ -96,6 +100,20 @@ device-bound, with a comment explaining that a bare `current_stream()` returns a
 - `dcp_topk_merge.py:476` — guarded in the wrapper, as above.
 - `fused_compress_attn_hca.py` — guarded explicitly and deliberately, with the comment quoted
   in §1.
+- `moe_sorting_kernel.py` — the largest concentration and the worst *form*, but dead code. Its
+  eight launcher closures (`:757`, `:991`, `:1049`, `:1189`, `:1383`, `:1628`, `:1665`, `:1717`)
+  each declare `stream: fx.Stream = None` and then run
+  `stream = stream if stream is not None else fx.Stream(None)` — an explicit None-check that
+  resolves *to* the NULL stream, exactly inverting what §1 prescribes while reading like a guard.
+  It never binds: `moe_sorting_flydsl` (`:1846`) passes
+  `fx.Stream(torch.cuda.current_stream(device))` to the oneshot path (`:1973`) and binds
+  `stream = torch.cuda.current_stream(device)` (`:1999`) for the multiphase paths, in both cases
+  **positionally as the final `_run_compiled` argument**. The public wrapper
+  `aiter/ops/flydsl/moe_sorting.py:19` passes no stream at all, so the defaulted `None` would
+  reach the inverse guard were it not shadowed one layer down. The path is additionally off by
+  default: `AITER_USE_FLYDSL_MOE_SORTING` gates it and defaults to `"0"` (`aiter/fused_moe.py:60`).
+  This is the strongest illustration of the report's thesis — the anti-pattern is present, reads
+  as safe, and is inert only by the accident of a call-site convention nothing enforces.
 
 **Not audited:** the remaining ten modules in the last row of the table. Their wrappers are not
 co-located, so establishing reachability means finding each public entry point individually. No
@@ -118,6 +136,16 @@ Preferred, in order:
    `if stream is None: stream = torch.cuda.current_stream()` pattern, device-bound as in
    `dcp_topk_merge.py:161`. Lower churn, preserves the ergonomic default, but leaves the trap in
    place for any future caller that bypasses the wrapper.
+
+**Option 1 has an in-tree precedent, and it is a cautionary one.** `pa_decode_gluon.py` already
+removed the parameter default: the launcher declares `stream: fx.Stream` (`:4946`) and the call
+site now reads `stream=fx.Stream(None)` (`:5136`), with a comment at `:5134-5135` recording that
+it "was the `fx.Stream(None)` parameter default; passed explicitly now that the default is gone."
+De-optionalizing therefore moved the NULL stream from the signature to the caller and changed no
+behaviour. That is the failure mode of option 1 applied mechanically: making the argument
+required forces every call site to name a stream, but does not stop it naming the wrong one. Any
+adoption of option 1 must pair the signature change with an audit of what each call site then
+passes, or it converts a silent default into a silent explicit choice.
 
 Option 1 is correct; option 2 is what the codebase already does where it does anything. A
 `# noqa: B008` — present on nearly every one of these sites, in one case annotated "framework
