@@ -844,11 +844,19 @@ def _resolve_quant_dtypes(
     gate_mode,
     a1_scale,
     dtype,
+    *,
+    fused_router_quant=False,
 ):
     """Pick the activation/weight quant dtypes for a 2-stage MoE launch.
 
     Shared by ``fused_moe_`` and ``fused_moe_router`` so both agree on the
     dtype that sizes the sorted buffers and keys the tuned config lookup.
+
+    Args:
+        fused_router_quant: the caller is ``fused_moe_router``, which folds the
+            MXFP4 activation quant into its routing kernel. Suppresses the
+            small-M bf16 SwiGLU fallback, which has nothing to trade away once
+            the quant is free.
 
     Returns:
         ``(dtype, quant_type, q_dtype_a, q_dtype_w)`` -- the resolved output
@@ -893,7 +901,19 @@ def _resolve_quant_dtypes(
             else:
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+            # Below the bound, bf16 activations avoid a standalone quant launch
+            # at the price of the wider a16w4 GEMM; above it, fp4x2 pays that
+            # launch to get the narrower a4w4 one. fused_moe_router quantizes
+            # inside its routing kernel, so the launch the bound is avoiding
+            # does not exist for it: it can take the narrower GEMM for free at
+            # every M. Keeping the bound here would also hand the router a bf16
+            # q_dtype_a that its own `q_dtype_a == fp4x2` assert rejects.
+            if fused_router_quant:
+                q_dtype_a = dtypes.fp4x2
+            else:
+                q_dtype_a = (
+                    dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+                )
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
@@ -1506,7 +1526,13 @@ def fused_moe_router_config_supported(
     return (
         fused_moe_router_arch_supported()
         and QuantType(quant_type) == QuantType.per_1x32
-        and ActivationType(activation) == ActivationType.Silu
+        # The routing kernel fuses topk, the sort and the MXFP4 quant -- none
+        # of which read the activation (fused_moe_router_impl takes no
+        # `activation` arg). The activation is applied by the stage1 GEMM that
+        # fused_moe_2stages selects, so admitting Swiglu here changes nothing
+        # the fused kernel does.
+        and ActivationType(activation)
+        in (ActivationType.Silu, ActivationType.Swiglu)
         and GateMode(gate_mode) == GateMode.SEPARATED
         and w1_dtype == dtypes.fp4x2
         and hidden_dtype == dtypes.bf16
@@ -1594,7 +1620,15 @@ def fused_moe_router_supported(
     M = hidden_states.shape[0]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
-        M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
+        M,
+        hidden_states,
+        w1,
+        quant_type,
+        activation,
+        gate_mode,
+        a1_scale,
+        dtype,
+        fused_router_quant=True,
     )
     # dtype overrides hidden_states.dtype and sizes moe_buf, which the kernel
     # zero-fills as bf16.
@@ -1654,6 +1688,7 @@ def fused_moe_router(
     shared_expert_weight: float = 1.0,
     ep_rank: int = 0,
     ep_size: int = 1,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """MoE forward that routes internally, replacing the 4-kernel preamble.
 
@@ -1690,6 +1725,10 @@ def fused_moe_router(
         ep_size: EP world size. Shared weights are replicated per rank, so
             token ownership round-robins over it to keep the post-MoE
             all-reduce from summing ``ep_size`` copies of the shared output.
+        swiglu_limit: clamp bound for ``ActivationType.Swiglu``. Forwarded
+            verbatim to ``fused_moe_2stages``; ``None`` leaves stage1
+            unclamped. The matching ``alpha`` is not a parameter -- the MXMOE
+            stage1 kernel bakes in 1.702.
 
     Returns:
         ``[M, model_dim]`` output in ``dtype`` (default ``hidden_states``').
@@ -1724,7 +1763,15 @@ def fused_moe_router(
     topk_total = topk + n_shared
 
     dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
-        M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
+        M,
+        hidden_states,
+        w1,
+        quant_type,
+        activation,
+        gate_mode,
+        a1_scale,
+        dtype,
+        fused_router_quant=True,
     )
 
     metadata = get_2stage_cfgs(
@@ -1889,6 +1936,7 @@ def fused_moe_router(
         topk_weights=topk_weights,
         gate_mode=gate_mode,
         expert_mask=expert_mask,
+        swiglu_limit=swiglu_limit,
         a1_prequant=(a1, a1_scale_sorted),
         _metadata=metadata,
     )
