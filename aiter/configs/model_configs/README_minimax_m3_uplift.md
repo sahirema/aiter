@@ -323,3 +323,43 @@ node state (`rocm-smi --showpids`, `rocm-smi --showuse`, `docker ps`) **per arm*
 once per chain; and report generated-token counts per row so generation-length drift can be
 excluded. One run per arm cannot resolve a sub-5% effect — plan at least two independent
 arm-pairs per TP.
+
+## Uplift-item status across the M3 round
+
+These tables are one item in a larger MiniMax-M3 uplift round. The rest of the round
+lives on branches in the sglang and aiter forks; this is which branch carries which
+item and whether it has been measured, as of 2026-09-21. Repo prefix `sg` = sglang
+fork, `aiter` = aiter fork.
+
+| Uplift item | Branch(es) | Tested |
+|---|---|---|
+| a6 index top-k freq | *(env var only)* | yes |
+| a1int4 QuickReduce | *(env var only)* | yes, stacked |
+| a4 SwiGLU bound | *(env var only)* | yes, stacked (`a6a1int4a4`) |
+| Router + sort fusion | sg `feat/m3-fused-router-bypass` · aiter `feat/m3-fused-router-swiglu` · aiter `sahirema/minimax-m3-fused-router-sort` | no — image built |
+| Shared-experts fusion | sg `feat/m3-rocm-shared-experts-fusion` | no |
+| Decode elementwise (A5) | sg `feat/m3-decode-elementwise` · sg `image/m3-decode-elementwise-v0.5.16` | no |
+| Fused qk-norm — route 1 | sg `feat/minimax-m3-rocm-fused-qknorm-idxrqknorm` | no |
+| Fused qk-norm — route 2, Triton | sg `feat/m3-triton-fused-qknorm-fp8-kv-store` | no |
+| Fused qk-norm — route 2, aiter | sg `feat/m3-aiter-fused-qknorm-fp8-kv-store` | no — needs env gate |
+| fp8 KV store fusion | sg `feat/m3-sparse-fused-fp8-kv-store` | no |
+| Index-K store cache (A7) | sg `feat/m3-index-k-store-cache` | no |
+| MXFP4 dense-GEMM tuning (6b) | aiter `sahirema/minimax-m3-mxfp4-gemm-tune` | no — harness + shapes only |
+| BF16 dense-GEMM tuned tables *(this document)* | *(no branch — tables shipped here)* | 5.16 only; void on 5.20 |
+| Fused QKV index MXFP4 | sg `feat/m3-fused-qkv-index-mxfp4` | branch is empty (== `main`) |
+| Sparse-attn top-k block fusion | *none* | not implemented |
+| MoE expert GEMM FP4 epilogue | *none* | not implemented |
+| Decode small-copy batching | *none* | not implemented |
+
+Two distinctions that are easy to lose:
+
+- **The measured arms were stacked, not standalone.** `a6a1int4a4` is a6 + a1int4 + a4
+  applied together; standalone `a1int4` and standalone `a4` were dropped, as were
+  `a1fp`, `a1int8` and `a1int6`.
+- **"Elementwise" names two separate items** — `feat/m3-decode-elementwise` (removes
+  three per-step kernel launches from paged decode alloc) and
+  `feat/m3-rocm-shared-experts-fusion` (shared-experts fusion).
+
+Item 6b targets the **Triton** MXFP4 lane (`GEMM-AFP4WFP4`, per-shape JSON under
+`aiter/ops/triton/configs/gfx950/`), which is the lane sglang's quark path uses. The
+tables in this document are the **BF16** dense-GEMM lane. The two are independent.
