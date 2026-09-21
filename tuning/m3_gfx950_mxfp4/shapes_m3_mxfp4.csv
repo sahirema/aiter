@@ -1,0 +1,50 @@
+# MiniMax-M3-MXFP4 (amd/MiniMax-M3-MXFP4) dense MXFP4 GEMM shapes on gfx950 / MI355X.
+#
+# THIS FILE CONTAINS SHAPES ONLY -- NO MEASURED TIMINGS, NO TUNED PARAMETERS.
+# It is the *input* to the tuning sweep, not an output. Tuned rows are produced
+# only by running tune_m3_gfx950_mxfp4.sh on a GPU node; see README.md.
+#
+# Derivation (all Tier 2, read this session):
+#   hidden_size=6144, intermediate_size=3072, n_shared_experts=1
+#     -- config.json of the HF snapshot b83d14e3d64bf373a207f3c2a7e9f0b0f1e7fc3a
+#   Only shared_experts.{gate,up,down}_proj carry .weight_scale among the dense
+#   linears (model.safetensors.index.json); every q/k/v/o_proj, the 3 dense MLP
+#   layers and lm_head are in quantization_config.exclude. MoE experts w1/w2/w3
+#   are MXFP4 but run on the fused-MoE path, not gemm_afp4wfp4.
+#   sglang minimax_m3.py:392-404  shared_experts = MiniMaxM3MLP(
+#       intermediate_size = config.intermediate_size * n_shared_experts = 3072)
+#   sglang minimax_m3.py:270-289  gate_up = MergedColumnParallelLinear(hidden,[I]*2)
+#                                          -> local N = 2*I/tp
+#                                 down    = RowParallelLinear(I, hidden)
+#                                          -> local N = hidden, K = I/tp
+#   (line numbers on upstream/release/v0.5.20, the branch the benchmark image
+#    is cut from; upstream main has since renumbered.)
+#
+# K is the LOGICAL (unpacked) K. test_gemm_afp4wfp4.py:52 builds x as (M, K//2),
+# and _triton_kernels/gemm/basic/gemm_afp4wfp4.py:725-726 doubles the packed K
+# back before building the filename -- so this K is what lands in the JSON name.
+#
+# variant: which branch of minimax_m3.py:392-404 is live at runtime.
+#   tp_sharded  -- default TP path, sharded by the model's tp_size
+#                  (any non-DeepEP a2a backend)
+#   replicated  -- get_moe_a2a_backend().is_deepep() -> tp_rank=0, tp_size=1,
+#                  so the replicated pair is TP-INDEPENDENT and is swept once
+# All TP degrees we run on an 8-GPU MI355X node are listed (tp2/tp4/tp8); the
+# canonical MiniMax-M3 config is tp2, the others are for TP-variant arms
+# (protocol v4 SS2). 8 distinct (N,K) keys, no collisions.
+#
+# Reachability: shared_experts is built only when num_fused_shared_experts == 0.
+# On upstream/release/v0.5.20 the ROCm gate returns "Shared experts fusion
+# currently requires CUDA devices." (minimax_m3_vl.py:155-156), so fusion is OFF and
+# the module IS built. On upstream main after 241a5b9823 (2026-09-16) fusion is
+# enabled on gfx950 and NONE of these shapes run.
+#
+config_family,N,K,module,variant,formula,target_config_filename
+GEMM-AFP4WFP4,3072,6144,shared_experts.gate_up_proj,tp_sharded_tp2,N=2*3072/2;K=6144,GEMM-AFP4WFP4-N=3072-K=6144.json
+GEMM-AFP4WFP4,6144,1536,shared_experts.down_proj,tp_sharded_tp2,N=6144;K=3072/2,GEMM-AFP4WFP4-N=6144-K=1536.json
+GEMM-AFP4WFP4,1536,6144,shared_experts.gate_up_proj,tp_sharded_tp4,N=2*3072/4;K=6144,GEMM-AFP4WFP4-N=1536-K=6144.json
+GEMM-AFP4WFP4,6144,768,shared_experts.down_proj,tp_sharded_tp4,N=6144;K=3072/4,GEMM-AFP4WFP4-N=6144-K=768.json
+GEMM-AFP4WFP4,768,6144,shared_experts.gate_up_proj,tp_sharded_tp8,N=2*3072/8;K=6144,GEMM-AFP4WFP4-N=768-K=6144.json
+GEMM-AFP4WFP4,6144,384,shared_experts.down_proj,tp_sharded_tp8,N=6144;K=3072/8,GEMM-AFP4WFP4-N=6144-K=384.json
+GEMM-AFP4WFP4,6144,6144,shared_experts.gate_up_proj,replicated,N=2*3072/1;K=6144,GEMM-AFP4WFP4-N=6144-K=6144.json
+GEMM-AFP4WFP4,6144,3072,shared_experts.down_proj,replicated,N=6144;K=3072/1,GEMM-AFP4WFP4-N=6144-K=3072.json
